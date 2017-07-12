@@ -1,0 +1,8 @@
+docs/_build
+__pycache__/
+.vscode
+venv*
+
+benchmarks/curio/
+benchmarks/env/
+benchmarks/results/
