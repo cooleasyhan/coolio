@@ -20,3 +20,6 @@ from collections import Counter, defaultdict
 # -- Coolio
 from .errors import CancelledError
 from .traps import _future_wait, _get_kernel
+
+
+import curio
