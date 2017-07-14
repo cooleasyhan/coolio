@@ -2,44 +2,40 @@ import selectors
 import socket
 import select
 sel = selectors.DefaultSelector()
-sel.register
 
 
-def accept(sock, mask):
-    print('accept mask', mask)
+def handler(fileobj, mask, data):
     if mask == selectors.EVENT_READ:
-        conn, addr = sock.accept()
-        print('accepted', conn, 'from', addr)
-        conn.setblocking(False)
-        sel.register(conn, selectors.EVENT_READ, read)
-    else:
-        sel.modify(sock, selectors.EVENT_WRITE, write)
+        if fileobj == sock:
+            conn, addr = fileobj.accept()
+            print('accepted', conn, 'from', addr)
+            conn.setblocking(False)
+            sel.register(conn, selectors.EVENT_READ)
+        else:
+            conn = fileobj
+            data = conn.recv(100000)
+            if data:
+                print('recving data', data, 'from ', conn)
+                resp = data
+                sel.modify(conn, selectors.EVENT_WRITE, resp)
 
-def write(conn, mask):
-    conn.send(b'Hello\n')
-    sel.modify(conn, selectors.EVENT_READ, read)
-
-def read(conn, mask):
-    data = conn.recv(1000)
-    if data:
-        print('echoing', repr(data), 'to', conn)
-        sel.modify(conn, selectors.EVENT_WRITE, write)
-        #conn.send(data)
-        
+            else:
+                print('closing', conn)
+                sel.unregister(conn)
+                conn.close()
     else:
-        print('closing', conn)
-        sel.unregister(conn)
-        conn.close()
+        conn = fileobj
+        fileobj.send(data)
+        sel.modify(conn, selectors.EVENT_READ)
 
 
 sock = socket.socket()
-sock.bind(('localhost', 1234))
+sock.bind(('localhost', 12345))
 sock.listen(100)
 sock.setblocking(False)
-sel.register(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, accept)
+sel.register(sock, selectors.EVENT_READ | selectors.EVENT_WRITE)
 
 while True:
     events = sel.select()
     for key, mask in events:
-        callback = key.data
-        callback(key.fileobj, mask)
+        handler(key.fileobj, mask, key.data)
