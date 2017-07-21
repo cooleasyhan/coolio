@@ -4,6 +4,24 @@ import select
 sel = selectors.DefaultSelector()
 
 
+def add_status(resp, status='200', status_text='OK'):
+    resp.insert(0, f'HTTP/1.1 {status} {status_text}')
+
+
+def add_header(resp, name, value):
+    resp.insert(1, f'{name}: {value}')
+
+
+def add_body(resp, body):
+    resp.append('')
+    resp.append(body)
+    add_header(resp, 'Content-length', len(body.encode('utf-8')))
+
+
+def get_resp(resp):
+    return '\r\n'.join(resp).encode('utf-8')
+
+
 def handler(fileobj, mask, data):
     if mask == selectors.EVENT_READ:
         if fileobj == sock:
@@ -13,11 +31,28 @@ def handler(fileobj, mask, data):
             sel.register(conn, selectors.EVENT_READ)
         else:
             conn = fileobj
-            data = conn.recv(100000)
+            data = conn.recv(100000).decode('utf-8')
             if data:
-                print('recving data', data, 'from ', conn)
-                resp = data
-                sel.modify(conn, selectors.EVENT_WRITE, resp)
+                resp = []
+                add_status(resp)
+
+                resp_header = list(resp)
+
+
+                add_body(resp, '''<html>
+<header>
+</header>
+<body>
+Request Data:
+<pre>
+{request_content}
+Response Header:
+{response_header}
+</pre>
+</body>
+</html>'''.format(request_content=data, response_header='\r\n'.join(resp_header)))
+
+                sel.modify(conn, selectors.EVENT_WRITE, get_resp(resp))
 
             else:
                 print('closing', conn)
@@ -30,8 +65,8 @@ def handler(fileobj, mask, data):
 
 
 sock = socket.socket()
-sock.bind(('localhost', 12345))
-sock.listen(100)
+sock.bind(('localhost', 9002))
+sock.listen(1)
 sock.setblocking(False)
 sel.register(sock, selectors.EVENT_READ | selectors.EVENT_WRITE)
 
