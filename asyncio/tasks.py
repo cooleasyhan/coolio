@@ -1,4 +1,4 @@
-from asyncio import events, base_futures, futures
+from asyncio import events, base_futures, futures, coroutine,ensure_future
 import traceback
 import sys
 import weakref
@@ -9,6 +9,36 @@ import logging
 import os
 import selectors
 import inspect
+
+import collections
+import time
+import types
+_COROUTINE_TYPES = (types.GeneratorType)
+try:
+    _types_coroutine = types.coroutine
+    _types_CoroutineType = types.CoroutineType
+except AttributeError:
+    # Python 3.4
+    _types_coroutine = None
+    _types_CoroutineType = None
+
+
+
+# A marker for iscoroutinefunction.
+_is_coroutine = object()
+# if _CoroutineABC is not None:
+#     _COROUTINE_TYPES += (_CoroutineABC,)
+# if _types_CoroutineType is not None:
+#     # Prioritize native coroutine check to speed-up
+#     # asyncio.iscoroutine.
+#     _COROUTINE_TYPES = (_types_CoroutineType,) + _COROUTINE_TYPES
+
+
+def iscoroutine(obj):
+    """Return True if obj is a coroutine object."""
+    return isinstance(obj, _COROUTINE_TYPES)
+
+_inspect_iscoroutinefunction = inspect.iscoroutinefunction
 
 CancelledError = base_futures.CancelledError
 InvalidStateError = base_futures.InvalidStateError
@@ -35,10 +65,7 @@ class Handle:
         self._args = args
         self._cancelled = False
         self._repr = None
-        if self._loop.get_debug():
-            self._source_traceback = traceback.extract_stack(sys._getframe(1))
-        else:
-            self._source_traceback = None
+        self._source_traceback = None
 
     # def _repr_info(self):
     #     info = [self.__class__.__name__]
@@ -60,11 +87,7 @@ class Handle:
     def cancel(self):
         if not self._cancelled:
             self._cancelled = True
-            if self._loop.get_debug():
-                # Keep a representation in debug mode to keep callback and
-                # parameters. For example, to log the warning
-                # "Executing <Handle...> took 2.5 second"
-                self._repr = repr(self)
+
             self._callback = None
             self._args = None
 
@@ -104,8 +127,6 @@ class Futhure:
             self._loop = loop
 
         self._callbacks = []
-        if self._loop.get_debug():
-            self._source_traceback = traceback.extract_stack(sys._getframe(1))
 
     _repr_info = base_futures._future_repr_info
 
@@ -377,8 +398,93 @@ def _set_running_loop(loop):
 
 
 class Myloop(events.AbstractEventLoop):
-    def __init__(self):
+    def __init__(self,selector=None):
+        self._timer_cancelled_count = 0
+        self._closed = False
+        self._stopping = False
+        self._ready = collections.deque()
+        self._scheduled = []
+        self._default_executor = None
+        self._internal_fds = 0
+        # Identifier of the thread running the event loop, or None if the
+        # event loop is not running
+        self._thread_id = None
+        self._clock_resolution = time.get_clock_info('monotonic').resolution
+        self._exception_handler = None
+
+        # In debug mode, if the execution of a callback or a step of a task
+        # exceed this duration in seconds, the slow callback/task is logged.
+        self.slow_callback_duration = 0.1
+        self._current_handle = None
+        self._task_factory = None
+        self._coroutine_wrapper_set = False
+
+        if hasattr(sys, 'get_asyncgen_hooks'):
+            # Python >= 3.6
+            # A weak set of all asynchronous generators that are
+            # being iterated by the loop.
+            self._asyncgens = weakref.WeakSet()
+        else:
+            self._asyncgens = None
+
+        # Set to True when `loop.shutdown_asyncgens` is called.
+        self._asyncgens_shutdown_called = False
+        self._debug = False
+        if selector is None:
+            selector = selectors.DefaultSelector()
+        logger.debug('Using selector: %s', selector.__class__.__name__)
+        self._selector = selector
+        # self._make_self_pipe()
+        self._transports = weakref.WeakValueDictionary()
+    def _make_self_pipe(self):
+        # A self-socket, really. :-)
+        self._ssock, self._csock = self._socketpair()
+        self._ssock.setblocking(False)
+        self._csock.setblocking(False)
+        self._internal_fds += 1
+        self._add_reader(self._ssock.fileno(), self._read_from_self)
+
+    def _process_self_data(self, data):
         pass
+
+    def time(self):
+        """Return the time according to the event loop's clock.
+
+        This is a float expressed in seconds since an epoch, but the
+        epoch, precision, accuracy and drift are unspecified and may
+        differ per event loop.
+        """
+        return time.monotonic()
+
+    def _read_from_self(self):
+        while True:
+            try:
+                data = self._ssock.recv(4096)
+                if not data:
+                    break
+                self._process_self_data(data)
+            except InterruptedError:
+                continue
+            except BlockingIOError:
+                break
+    
+    def _write_to_self(self):
+        # This may be called from a different thread, possibly after
+        # _close_self_pipe() has been called or even while it is
+        # running.  Guard for self._csock being None or closed.  When
+        # a socket is closed, send() raises OSError (with errno set to
+        # EBADF, but let's not rely on the exact error code).
+        csock = self._csock
+        if csock is not None:
+            try:
+                csock.send(b'\0')
+            except OSError:
+                if self._debug:
+                    logger.debug("Fail to write a null byte into the "
+                                 "self-pipe socket",
+                                 exc_info=True)
+
+
 
     def run_forever(self):
 
@@ -394,6 +500,13 @@ class Myloop(events.AbstractEventLoop):
             self._thread_id = None
             _set_running_loop(None)
             self._set_coroutine_wrapper(False)
+
+    def _set_coroutine_wrapper(self, enabled):
+        pass
+
+    def _check_closed(self):
+        if self._closed:
+            raise RuntimeError('Event loop is closed')
 
     def run_until_complete(self, future):
         """Run until the Future is done.
@@ -441,8 +554,6 @@ class Myloop(events.AbstractEventLoop):
 
     def _call_soon(self, callback, args):
         handle = Handle(callback, args, self)
-        if handle._source_traceback:
-            del handle._source_traceback[-1]
         self._ready.append(handle)
         return handle
 
@@ -574,6 +685,7 @@ class Myloop(events.AbstractEventLoop):
         return self._remove_writer(fd)
 
     def _run_once(self):
+        # print('_run_once')
         """Run one full iteration of the event loop.
 
         This calls all currently ready callbacks, polls for I/O,
@@ -665,3 +777,125 @@ def _run_until_complete_cb(fut):
         # stop it.
         return
     fut._loop.stop()
+
+
+def test():
+    print(1)
+    yield time.sleep(1)
+    print(2)
+
+
+def coroutine1(func):
+    """Decorator to mark coroutines.
+
+    If the coroutine is not yielded from before it is destroyed,
+    an error message is logged.
+    """
+    if _inspect_iscoroutinefunction(func):
+        # In Python 3.5 that's all we need to do for coroutines
+        # defiend with "async def".
+        # Wrapping in CoroWrapper will happen via
+        # 'sys.set_coroutine_wrapper' function.
+        return func
+
+    if inspect.isgeneratorfunction(func):
+        coro = func
+    else:
+        @functools.wraps(func)
+        def coro(*args, **kw):
+            res = func(*args, **kw)
+            if (base_futures.isfuture(res) or inspect.isgenerator(res) or
+                isinstance(res, CoroWrapper)):
+                res = yield from res
+            elif _AwaitableABC is not None:
+                # If 'func' returns an Awaitable (new in 3.5) we
+                # want to run it.
+                try:
+                    await_meth = res.__await__
+                except AttributeError:
+                    pass
+                else:
+                    if isinstance(res, _AwaitableABC):
+                        res = yield from await_meth()
+            return res
+    _DEBUG = False
+    if not _DEBUG:
+        if _types_coroutine is None:
+            wrapper = coro
+        else:
+            wrapper = _types_coroutine(coro)
+    else:
+        @functools.wraps(func)
+        def wrapper(*args, **kwds):
+            w = CoroWrapper(coro(*args, **kwds), func=func)
+            if w._source_traceback:
+                del w._source_traceback[-1]
+            # Python < 3.5 does not implement __qualname__
+            # on generator objects, so we set it manually.
+            # We use getattr as some callables (such as
+            # functools.partial may lack __qualname__).
+            w.__name__ = getattr(func, '__name__', None)
+            w.__qualname__ = getattr(func, '__qualname__', None)
+            return w
+
+    wrapper._is_coroutine = _is_coroutine  # For iscoroutinefunction().
+    return wrapper
+
+@coroutine
+def _wrap_awaitable(awaitable):
+    """Helper for asyncio.ensure_future().
+
+    Wraps awaitable (an object with __await__) into a coroutine
+    that will later be wrapped in a Task by ensure_future().
+    """
+    return (yield from awaitable.__await__())
+
+
+
+def ensure_future(coro_or_future, *, loop=None):
+    """Wrap a coroutine or an awaitable in a future.
+
+    If the argument is a Future, it is returned directly.
+    """
+    if futures.isfuture(coro_or_future):
+        if loop is not None and loop is not coro_or_future._loop:
+            raise ValueError('loop argument must agree with Future')
+        return coro_or_future
+    elif iscoroutine(coro_or_future):
+        if loop is None:
+            loop = events.get_event_loop()
+        task = loop.create_task(coro_or_future)
+        if task._source_traceback:
+            del task._source_traceback[-1]
+        return task
+    elif inspect.isawaitable(coro_or_future):
+        return ensure_future(_wrap_awaitable(coro_or_future), loop=loop)
+    else:
+        raise TypeError('A Future, a coroutine or an awaitable is required')
+
+
+
+def main():
+    import time
+    import asyncio
+    
+    now = lambda : time.time()
+    @coroutine
+    def do_some_work(x):
+        print('aaaa')
+        yield 'a'
+        print('Waiting: ', x)
+    
+    start = now()
+    
+    c1 = do_some_work(2)
+    c1 = ensure_future(c1)
+    # t = Task(coroutine)
+    
+    loop = get_event_loop()
+    loop.run_until_complete(c1)
+    
+    print('TIME: ', now() - start)
+
+if __name__ == '__main__':
+    main()
